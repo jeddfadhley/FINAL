@@ -27,6 +27,7 @@ set src_files [list \
     "UART_RX_CTRL.vhd" \
     "UART_TX_CTRL.vhd" \
     "dataGen.vhd" \
+    "dataConsumeWrapper.vhd" \
     "unsigned/dataConsume.edn" \
     "Cmod-A7-Master.xdc" \
 ]
