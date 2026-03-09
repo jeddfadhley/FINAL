@@ -37,7 +37,6 @@ architecture FSM of cmdProc is
         WAIT_DATA,
         DATA_TX,
         DATA_WAIT,
-        WAIT_DR_LOW,
         REQ_DATA,
         -- Newline (LF + CR) before p/l output
         SEND_LF,
@@ -319,7 +318,7 @@ begin
                 next_nibble_cnt <= (others => '0');
                 next_state      <= WAIT_DATA;
 
-            -- WAIT_DATA: wait for streaming byte or sequence complete
+            -- WAIT_DATA: wait for dataReady (byte available from dataConsume)
             when WAIT_DATA =>
                 if seq_done_flag = '1' then
                     next_state <= IDLE;
@@ -335,7 +334,7 @@ begin
                 txnow  <= '1';
                 next_state <= DATA_WAIT;
 
-            -- DATA_WAIT: wait for TX done, advance nibble or return
+            -- DATA_WAIT: wait for TX done, advance nibble or next byte
             when DATA_WAIT =>
                 txData <= nibble_mux(nibble_cnt, tx_byte);
                 if txdone = '1' then
@@ -343,21 +342,14 @@ begin
                         next_nibble_cnt <= nibble_cnt + 1;
                         next_state      <= DATA_TX;
                     else
+                        -- All 3 chars sent for this byte
                         next_nibble_cnt <= (others => '0');
                         if seq_done_flag = '1' then
                             next_state <= IDLE;
                         else
-                            next_state <= WAIT_DR_LOW;
+                            next_state <= REQ_DATA;
                         end if;
                     end if;
-                end if;
-
-            -- WAIT_DR_LOW: wait for dataReady to deassert
-            when WAIT_DR_LOW =>
-                if seq_done_flag = '1' then
-                    next_state <= IDLE;
-                elsif dataReady = '0' then
-                    next_state <= REQ_DATA;
                 end if;
 
             -- REQ_DATA: pulse start to request next byte from dataConsume
