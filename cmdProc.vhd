@@ -34,33 +34,51 @@ architecture FSM of cmdProc is
         GET_DIGIT,
         START_DP,
         WAIT_DATA,
-        TX_HI,
-        TX_HI_WAIT,
-        TX_LO,
-        TX_LO_WAIT,
-        TX_SPACE,
-        TX_SPACE_WAIT,
-        WAIT_READY_LOW
+        -- Streaming data TX (hi nibble, lo nibble, space)
+        DATA_TX,
+        DATA_WAIT,
+        WAIT_DR_LOW,
+        -- Results TX
+        RES_PREP,
+        RES_TX,
+        RES_WAIT,
+        -- Peak TX
+        PEAK_PREP,
+        PEAK_TX,
+        PEAK_WAIT
     );
 
     signal state, next_state : state_type := IDLE;
 
-    -- Registered data
+    -- Echo register
     signal echo_reg, next_echo_reg       : std_logic_vector(7 downto 0) := (others => '0');
+
+    -- BCD digit collection
     signal hundreds, next_hundreds       : unsigned(3 downto 0) := (others => '0');
     signal tens, next_tens               : unsigned(3 downto 0) := (others => '0');
     signal ones, next_ones               : unsigned(3 downto 0) := (others => '0');
     signal digit_count, next_digit_count : unsigned(1 downto 0) := (others => '0');
     signal cmd_valid, next_cmd_valid     : std_logic := '0';
+
+    -- Registered numWords output
+    signal reg_numWords : BCD_ARRAY_TYPE(2 downto 0) := (others => "1001");
+
+    -- TX byte register (holds current byte being transmitted as hex)
     signal tx_byte, next_tx_byte         : std_logic_vector(7 downto 0) := (others => '0');
-    signal tx_phase, next_tx_phase       : unsigned(1 downto 0) := (others => '0');
+
+    -- Nibble counter: 0=hi nibble, 1=lo nibble, 2=space
+    signal nibble_cnt, next_nibble_cnt   : unsigned(1 downto 0) := (others => '0');
+
+    -- Result/peak byte indices
     signal byte_idx, next_byte_idx       : unsigned(2 downto 0) := (others => '0');
     signal peak_idx, next_peak_idx       : unsigned(1 downto 0) := (others => '0');
 
-    -- Latched results (captured on seqDone)
+    -- Latched results (captured unconditionally on seqDone)
     signal reg_dataResults : CHAR_ARRAY_TYPE(0 to RESULT_BYTE_NUM-1) := (others => (others => '0'));
     signal reg_maxIndex    : BCD_ARRAY_TYPE(2 downto 0) := (others => (others => '0'));
-    signal data_complete   : std_logic := '0';
+
+    -- Sticky flag: set when seqDone fires, cleared on START_DP
+    signal seq_done_flag : std_logic := '0';
 
     function to_hex(nibble : std_logic_vector(3 downto 0)) return std_logic_vector is
     begin
@@ -85,11 +103,20 @@ architecture FSM of cmdProc is
         end case;
     end function;
 
+    -- Helper: get txData based on nibble_cnt and tx_byte
+    function nibble_mux(cnt : unsigned(1 downto 0); byt : std_logic_vector(7 downto 0))
+        return std_logic_vector is
+    begin
+        case cnt is
+            when "00"   => return to_hex(byt(7 downto 4));
+            when "01"   => return to_hex(byt(3 downto 0));
+            when others => return x"20";
+        end case;
+    end function;
+
 begin
 
-    numWords_bcd(2) <= std_logic_vector(hundreds);
-    numWords_bcd(1) <= std_logic_vector(tens);
-    numWords_bcd(0) <= std_logic_vector(ones);
+    numWords_bcd <= reg_numWords;
 
     --------------------------------------------------------------------------
     -- State register
@@ -119,7 +146,7 @@ begin
                 digit_count <= (others => '0');
                 cmd_valid   <= '0';
                 tx_byte     <= (others => '0');
-                tx_phase    <= (others => '0');
+                nibble_cnt  <= (others => '0');
                 byte_idx    <= (others => '0');
                 peak_idx    <= (others => '0');
             else
@@ -130,7 +157,7 @@ begin
                 digit_count <= next_digit_count;
                 cmd_valid   <= next_cmd_valid;
                 tx_byte     <= next_tx_byte;
-                tx_phase    <= next_tx_phase;
+                nibble_cnt  <= next_nibble_cnt;
                 byte_idx    <= next_byte_idx;
                 peak_idx    <= next_peak_idx;
             end if;
@@ -138,21 +165,49 @@ begin
     end process;
 
     --------------------------------------------------------------------------
-    -- seqDone capture: latch dataResults and maxIndex
+    -- numWords_bcd register: latch BCD values when entering START_DP
     --------------------------------------------------------------------------
-    seq_done_capture: process(clk)
+    numwords_reg: process(clk)
     begin
         if rising_edge(clk) then
             if reset = '1' then
-                data_complete   <= '0';
+                reg_numWords <= (others => "1001");
+            elsif state = ECHO_WAIT and next_state = START_DP then
+                reg_numWords(2) <= std_logic_vector(hundreds);
+                reg_numWords(1) <= std_logic_vector(tens);
+                reg_numWords(0) <= std_logic_vector(ones);
+            end if;
+        end if;
+    end process;
+
+    --------------------------------------------------------------------------
+    -- seqDone data capture: always latch dataResults and maxIndex on seqDone
+    --------------------------------------------------------------------------
+    seq_data_capture: process(clk)
+    begin
+        if rising_edge(clk) then
+            if reset = '1' then
                 reg_dataResults <= (others => (others => '0'));
                 reg_maxIndex    <= (others => (others => '0'));
-            elsif state = START_DP then
-                data_complete <= '0';
             elsif seqDone = '1' then
                 reg_dataResults <= dataResults;
                 reg_maxIndex    <= maxIndex;
-                data_complete   <= '1';
+            end if;
+        end if;
+    end process;
+
+    --------------------------------------------------------------------------
+    -- seqDone flag: sticky, cleared on START_DP
+    --------------------------------------------------------------------------
+    seq_flag: process(clk)
+    begin
+        if rising_edge(clk) then
+            if reset = '1' then
+                seq_done_flag <= '0';
+            elsif state = START_DP then
+                seq_done_flag <= '0';
+            elsif seqDone = '1' then
+                seq_done_flag <= '1';
             end if;
         end if;
     end process;
@@ -161,11 +216,11 @@ begin
     -- Combinational logic: next state + outputs
     --------------------------------------------------------------------------
     comb_logic: process(state, rxnow, rxData, txdone, dataReady, byte,
-                        data_complete, echo_reg, hundreds, tens, ones,
-                        digit_count, cmd_valid, tx_byte, tx_phase,
+                        seq_done_flag, echo_reg, hundreds, tens, ones,
+                        digit_count, cmd_valid, tx_byte, nibble_cnt,
                         byte_idx, peak_idx, reg_dataResults, reg_maxIndex)
     begin
-        -- Defaults
+        -- Defaults: hold all registers
         next_state       <= state;
         next_echo_reg    <= echo_reg;
         next_hundreds    <= hundreds;
@@ -174,10 +229,11 @@ begin
         next_digit_count <= digit_count;
         next_cmd_valid   <= cmd_valid;
         next_tx_byte     <= tx_byte;
-        next_tx_phase    <= tx_phase;
+        next_nibble_cnt  <= nibble_cnt;
         next_byte_idx    <= byte_idx;
         next_peak_idx    <= peak_idx;
 
+        -- Output defaults
         rxdone <= '0';
         txnow  <= '0';
         txData <= (others => '0');
@@ -192,7 +248,7 @@ begin
                 if rxnow = '1' then
                     rxdone <= '1';
                     next_echo_reg <= rxData;
-                    if rxData = x"41" or rxData = x"61" then  -- 'A' or 'a'
+                    if rxData = x"41" or rxData = x"61" then
                         next_cmd_valid   <= '1';
                         next_digit_count <= (others => '0');
                     else
@@ -240,7 +296,7 @@ begin
                         end case;
                         next_digit_count <= digit_count + 1;
                     else
-                        next_cmd_valid <= '0';  -- invalid digit, abort
+                        next_cmd_valid <= '0';
                     end if;
                     next_state <= ECHO;
                 end if;
@@ -250,109 +306,136 @@ begin
             ----------------------------------------------------------------
             when START_DP =>
                 start <= '1';
-                next_tx_phase <= "00";
-                next_byte_idx <= (others => '0');
-                next_peak_idx <= (others => '0');
-                next_state    <= WAIT_DATA;
+                next_nibble_cnt <= (others => '0');
+                next_byte_idx   <= (others => '0');
+                next_peak_idx   <= (others => '0');
+                next_state      <= WAIT_DATA;
 
             ----------------------------------------------------------------
             -- WAIT_DATA: wait for streaming byte or sequence complete
             ----------------------------------------------------------------
             when WAIT_DATA =>
                 if dataReady = '1' then
-                    next_tx_byte <= byte;
-                    next_state   <= TX_HI;
-                elsif data_complete = '1' then
-                    -- Streaming done, start printing results
-                    next_tx_phase <= "01";
-                    next_byte_idx <= (others => '0');
-                    next_tx_byte  <= reg_dataResults(0);
-                    next_state    <= TX_HI;
+                    next_tx_byte    <= byte;
+                    next_nibble_cnt <= (others => '0');
+                    next_state      <= DATA_TX;
+                elsif seq_done_flag = '1' then
+                    next_byte_idx   <= (others => '0');
+                    next_state      <= RES_PREP;
                 end if;
 
+            -- =============================================================
+            -- STREAMING DATA TRANSMISSION
+            -- =============================================================
+
             ----------------------------------------------------------------
-            -- TX_HI: send high nibble
+            -- DATA_TX: send current nibble/space
             ----------------------------------------------------------------
-            when TX_HI =>
-                txData <= to_hex(tx_byte(7 downto 4));
+            when DATA_TX =>
+                txData <= nibble_mux(nibble_cnt, tx_byte);
                 txnow  <= '1';
-                next_state <= TX_HI_WAIT;
+                next_state <= DATA_WAIT;
 
-            when TX_HI_WAIT =>
-                txData <= to_hex(tx_byte(7 downto 4));
+            ----------------------------------------------------------------
+            -- DATA_WAIT: wait for TX done, advance nibble or return
+            ----------------------------------------------------------------
+            when DATA_WAIT =>
+                txData <= nibble_mux(nibble_cnt, tx_byte);
                 if txdone = '1' then
-                    next_state <= TX_LO;
+                    if nibble_cnt < 2 then
+                        next_nibble_cnt <= nibble_cnt + 1;
+                        next_state      <= DATA_TX;
+                    else
+                        next_nibble_cnt <= (others => '0');
+                        next_state      <= WAIT_DR_LOW;
+                    end if;
                 end if;
 
             ----------------------------------------------------------------
-            -- TX_LO: send low nibble
+            -- WAIT_DR_LOW: wait for dataReady to deassert
             ----------------------------------------------------------------
-            when TX_LO =>
-                txData <= to_hex(tx_byte(3 downto 0));
-                txnow  <= '1';
-                next_state <= TX_LO_WAIT;
-
-            when TX_LO_WAIT =>
-                txData <= to_hex(tx_byte(3 downto 0));
-                if txdone = '1' then
-                    next_state <= TX_SPACE;
-                end if;
-
-            ----------------------------------------------------------------
-            -- TX_SPACE: send space separator
-            ----------------------------------------------------------------
-            when TX_SPACE =>
-                txData <= x"20";
-                txnow  <= '1';
-                next_state <= TX_SPACE_WAIT;
-
-            ----------------------------------------------------------------
-            -- TX_SPACE_WAIT: route to next action based on phase
-            ----------------------------------------------------------------
-            when TX_SPACE_WAIT =>
-                txData <= x"20";
-                if txdone = '1' then
-                    case tx_phase is
-                        when "00" =>  -- streaming phase
-                            next_state <= WAIT_READY_LOW;
-
-                        when "01" =>  -- results phase
-                            if byte_idx < 6 then
-                                next_byte_idx <= byte_idx + 1;
-                                next_tx_byte  <= reg_dataResults(to_integer(byte_idx + 1));
-                                next_state    <= TX_HI;
-                            else
-                                -- Switch to peak phase
-                                next_tx_phase <= "10";
-                                next_peak_idx <= (others => '0');
-                                next_tx_byte  <= "0000" & reg_maxIndex(2);
-                                next_state    <= TX_HI;
-                            end if;
-
-                        when "10" =>  -- peak phase
-                            if peak_idx < 2 then
-                                next_peak_idx <= peak_idx + 1;
-                                case peak_idx is
-                                    when "00"   => next_tx_byte <= "0000" & reg_maxIndex(1);
-                                    when "01"   => next_tx_byte <= "0000" & reg_maxIndex(0);
-                                    when others => null;
-                                end case;
-                                next_state <= TX_HI;
-                            else
-                                next_state <= IDLE;
-                            end if;
-
-                        when others =>
-                            next_state <= IDLE;
-                    end case;
-                end if;
-
-            ----------------------------------------------------------------
-            -- WAIT_READY_LOW: wait for dataReady to deassert
-            ----------------------------------------------------------------
-            when WAIT_READY_LOW =>
+            when WAIT_DR_LOW =>
                 if dataReady = '0' then
                     next_state <= WAIT_DATA;
+                end if;
+
+            -- =============================================================
+            -- RESULTS TRANSMISSION (7 bytes from reg_dataResults)
+            -- =============================================================
+
+            ----------------------------------------------------------------
+            -- RES_PREP: load result byte into tx_byte
+            ----------------------------------------------------------------
+            when RES_PREP =>
+                next_tx_byte    <= reg_dataResults(to_integer(byte_idx));
+                next_nibble_cnt <= (others => '0');
+                next_state      <= RES_TX;
+
+            ----------------------------------------------------------------
+            -- RES_TX: send current nibble/space
+            ----------------------------------------------------------------
+            when RES_TX =>
+                txData <= nibble_mux(nibble_cnt, tx_byte);
+                txnow  <= '1';
+                next_state <= RES_WAIT;
+
+            ----------------------------------------------------------------
+            -- RES_WAIT: wait for TX done, advance nibble or next byte
+            ----------------------------------------------------------------
+            when RES_WAIT =>
+                txData <= nibble_mux(nibble_cnt, tx_byte);
+                if txdone = '1' then
+                    if nibble_cnt < 2 then
+                        next_nibble_cnt <= nibble_cnt + 1;
+                        next_state      <= RES_TX;
+                    else
+                        if byte_idx < 6 then
+                            next_byte_idx <= byte_idx + 1;
+                            next_state    <= RES_PREP;
+                        else
+                            next_peak_idx <= (others => '0');
+                            next_state    <= PEAK_PREP;
+                        end if;
+                    end if;
+                end if;
+
+            -- =============================================================
+            -- PEAK INDEX TRANSMISSION (3 BCD values from reg_maxIndex)
+            -- =============================================================
+
+            ----------------------------------------------------------------
+            -- PEAK_PREP: load peak BCD byte into tx_byte
+            ----------------------------------------------------------------
+            when PEAK_PREP =>
+                next_tx_byte    <= "0000" & reg_maxIndex(2 - to_integer(peak_idx));
+                next_nibble_cnt <= (others => '0');
+                next_state      <= PEAK_TX;
+
+            ----------------------------------------------------------------
+            -- PEAK_TX: send current nibble/space
+            ----------------------------------------------------------------
+            when PEAK_TX =>
+                txData <= nibble_mux(nibble_cnt, tx_byte);
+                txnow  <= '1';
+                next_state <= PEAK_WAIT;
+
+            ----------------------------------------------------------------
+            -- PEAK_WAIT: wait for TX done, advance nibble or next peak
+            ----------------------------------------------------------------
+            when PEAK_WAIT =>
+                txData <= nibble_mux(nibble_cnt, tx_byte);
+                if txdone = '1' then
+                    if nibble_cnt < 2 then
+                        next_nibble_cnt <= nibble_cnt + 1;
+                        next_state      <= PEAK_TX;
+                    else
+                        if peak_idx < 2 then
+                            next_peak_idx <= peak_idx + 1;
+                            next_state    <= PEAK_PREP;
+                        else
+                            next_state <= IDLE;
+                        end if;
+                    end if;
                 end if;
 
             when others =>
